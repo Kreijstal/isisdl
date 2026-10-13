@@ -3,12 +3,11 @@ import asyncio
 import sys
 
 import isisdl.compress as compress
-from isisdl.api.crud import authenticate_new_session
-from isisdl.api.download_urls import download_media_urls, gather_media_urls
+from isisdl.api.crud import authenticate_new_session, filter_courses
+from isisdl.api.download_urls import download_media_urls, gather_media_urls, sync_media_urls
 from isisdl.api.endpoints import UserCourseListAPI
-from isisdl.backend import sync_database
 from isisdl.backend.config import init_wizard, config_wizard
-from isisdl.backend.crud import read_or_create_config, read_or_migrate_user
+from isisdl.backend.crud import read_or_create_config, read_or_migrate_user, delete_corrupted_media_containers
 from isisdl.db_conf import init_database, DatabaseSessionMaker
 from isisdl.settings import is_first_time, is_static, forbidden_chars, has_ffmpeg, fstype, is_windows, working_dir_location, python_executable, is_macos, is_online
 from isisdl.utils import args, acquire_file_lock_or_exit, generate_error_message, install_latest_version, export_config, database_helper, config, migrate_database, Config, compare_download_diff
@@ -31,7 +30,7 @@ database_version = {Config.default("database_version")}
 """)
 
 
-async def _new_main() -> bool:
+async def _new_main(sync: bool = False) -> bool:
     with DatabaseSessionMaker() as db:
         config = read_or_create_config(db)
         user = await read_or_migrate_user(db, config)
@@ -50,8 +49,11 @@ async def _new_main() -> bool:
                 print("I could not get your courses from ISIS.")
                 return False
 
-            urls = await gather_media_urls(db, session, courses, config)
-            await download_media_urls(db, session, urls, config)
+            urls = await gather_media_urls(db, session, filter_courses(courses), config)
+            if sync:
+                await sync_media_urls(db, session, urls, config)
+            else:
+                await download_media_urls(db, session, urls, config)
 
             # TODO: How to deal with crashing threads
             #   - Have a menu which enables 3 choices:
@@ -113,7 +115,7 @@ Please press enter to continue.
 
     elif args.delete_bad_urls:
         print("Deleting bad urls ...")
-        database_helper.delete_bad_urls()
+        delete_corrupted_media_containers()
         sys.exit(0)
 
     if not is_online:
@@ -127,8 +129,7 @@ Please press enter to continue.
         sys.exit(0)
 
     elif args.sync:
-        sync_database.main()
-        sys.exit(0)
+        sys.exit(0 if asyncio.run(_new_main(sync=True)) else 1)
 
     elif args.compress:
         compress.main()

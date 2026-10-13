@@ -149,3 +149,14 @@ def replace_user_in_new_database(username: str | None, password: str | None, pas
             return
 
         asyncio.run(store_user_with_lookup(db, username, password, config))
+
+
+def delete_corrupted_media_containers() -> None:
+    """
+    Forgets the urls that were not downloadable, so they are checked again on the next run.
+    """
+    from isisdl.api.models import MediaContainer, MediaType
+
+    with DatabaseSessionMaker() as db:
+        db.execute(delete(MediaContainer).where(MediaContainer.media_type == MediaType.corrupted))
+        db.commit()

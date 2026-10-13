@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import enum
-import math
 import os
 import random
 import re
@@ -15,25 +14,21 @@ from functools import partial
 from html import unescape
 from itertools import repeat, chain
 from pathlib import Path
-from queue import Queue
-from threading import Thread, Lock, current_thread
-from typing import Optional, Dict, List, Any, cast, Iterable, DefaultDict, Tuple
+from threading import Lock
+from typing import Optional, Dict, List, Any, cast, Iterable, DefaultDict
 from urllib.parse import urlparse, ParseResultBytes
 
 from requests import Session, Response
 from requests.adapters import HTTPAdapter
 from requests.exceptions import InvalidSchema
 
-from isisdl.backend.crypt import get_credentials
-from isisdl.backend.status import StatusOptions, DownloadStatus, RequestHelperStatus
-from isisdl.settings import download_base_timeout, download_timeout_multiplier, download_static_sleep_time, num_tries_download, status_time, perc_diff_for_checksum, error_text, extern_ignore, \
-    log_file_location, datetime_str, regex_is_isis_document, token_queue_bandwidths_save_for, download_chunk_size, download_progress_bar_resolution, bandwidth_download_files_mavg_perc, \
-    checksum_algorithm
-from isisdl.settings import enable_multithread, discover_num_threads, is_windows, is_macos, is_testing, testing_bad_urls, url_finder, isis_ignore
-from isisdl.utils import User, path, sanitize_name, args, on_kill, database_helper, config, generate_error_message, logger, DownloadThrottler, MediaType, HumanBytes, normalize_url, \
+from isisdl.backend.status import StatusOptions, RequestHelperStatus
+from isisdl.settings import download_base_timeout, download_timeout_multiplier, download_static_sleep_time, num_tries_download, perc_diff_for_checksum, error_text, extern_ignore, \
+    log_file_location, datetime_str, regex_is_isis_document, download_progress_bar_resolution, checksum_algorithm
+from isisdl.settings import enable_multithread, discover_num_threads, is_testing, testing_bad_urls, url_finder, isis_ignore
+from isisdl.utils import User, path, sanitize_name, database_helper, config, generate_error_message, logger, DownloadThrottler, MediaType, HumanBytes, normalize_url, \
     get_download_url_from_url
 from isisdl.utils import calculate_local_checksum
-from isisdl.version import __version__
 
 
 class SessionWithKey(Session):
@@ -452,7 +447,7 @@ class MediaContainer:
     def stop(self) -> None:
         self._stop = True
 
-    def download(self, throttler: DownloadThrottler, session: SessionWithKey, is_stream: bool = False) -> bool:
+    def download(self, throttler: DownloadThrottler, session: SessionWithKey) -> bool:
         """
         The bool return value indicates if any downloading took place. Used for the bandwidth calculations.
         """
@@ -473,9 +468,6 @@ class MediaContainer:
             self.current_size = self.size.val
             self._done = True
             return False
-
-        if is_stream:
-            throttler.start_stream(self.path)
 
         download = session.get_(self.download_url, params={"token": session.token}, stream=True)
 
@@ -523,9 +515,6 @@ class MediaContainer:
             with self.path.open("wb"):
                 # Reopen the file such that previous content is ignored.
                 pass
-
-        if is_stream:
-            throttler.end_stream()
 
         download.close()
 
@@ -1033,340 +1022,6 @@ def check_for_conflicts_in_files(original_files: List[MediaContainer]) -> List[M
     assert len({it.download_url for it in final_files}) == len(final_files)
 
     return final_files
-
-
-class Downloader(Thread):
-    q: Queue[MediaContainer]
-    ret_q: Queue[tuple[int, bool]]
-    thread_id: int
-    status: DownloadStatus
-    throttler: DownloadThrottler
-    session: SessionWithKey
-
-    is_downloading: bool = False
-    _lock = Lock()
-
-    def __init__(self, q: Queue[MediaContainer], ret_q: Queue[tuple[int, bool]], thread_id: int, status: DownloadStatus, throttler: DownloadThrottler, session: SessionWithKey):
-        self.q = q
-        self.ret_q = ret_q
-        self.thread_id = thread_id
-        self.status = status
-        self.throttler = throttler
-        self.session = session
-
-        super().__init__(daemon=True)
-        self.start()
-
-    def run(self) -> None:
-        try:
-            while True:
-                file = self.q.get()
-                self.is_downloading = True
-                self.status.add_container(self.thread_id, file)
-
-                ret = file.download(self.throttler, self.session)
-                self.status.done(self.thread_id, file)
-                self.is_downloading = False
-                self.ret_q.put((self.thread_id, ret))
-
-        except Exception as ex:
-            with self._lock:
-                generate_error_message(ex)
-
-
-class CourseDownloader:
-    containers: List[MediaContainer] = []
-    _did_message: bool = False
-
-    def start(self) -> None:
-        user = get_credentials()
-        with RequestHelperStatus() as status:
-            helper = RequestHelper(user, status)
-            containers = helper.download_content(status)
-
-            for container in containers:
-                if container.should_download:
-                    container.path.open("w").close()
-
-                for link in database_helper.get_hardlinks(container):
-                    assert container.path.exists()
-                    assert container.path != link.path
-
-                    link.path.unlink(missing_ok=True)
-                    os.link(container.path, link.path)
-
-        CourseDownloader.containers = containers
-
-        # Log the metadata
-        conf = config.to_dict()
-        del conf["password"]
-
-        logger.post({
-            "num_g_files": len(containers),
-            "num_c_files": len(containers),
-            "course_ids": sorted([course.course_id for course in helper._courses]),
-
-            "config": conf,
-        })
-
-        if not any(item.should_download for item in containers):
-            for item in containers:
-                item._done = True
-
-            if not (config.telemetry_policy is False or is_testing):
-                logger.done.get()
-
-            self.message_what_did_i_do(containers)
-            return
-
-        # Make the runner a thread in case of a user needing to exit the program → downloading is done in the main thread
-        throttler = DownloadThrottler()
-        with DownloadStatus(containers, args.max_num_threads, throttler) as status:
-            Thread(target=self.stream_files, args=(containers, throttler, status, helper.session), daemon=True).start()
-            if not args.stream:
-                downloader = Thread(target=self.download_files, args=(containers, throttler, helper.session, status))
-                downloader.start()
-
-            if args.stream:
-                while True:
-                    time.sleep(65536)
-
-            downloader.join()
-
-        self.message_what_did_i_do(containers)
-
-    @staticmethod
-    def message_what_did_i_do(containers: List[MediaContainer]) -> None:
-        if CourseDownloader._did_message:
-            return
-
-        CourseDownloader._did_message = True
-
-        if not any(item._newly_downloaded or item._newly_discovered for item in containers):
-            print("No new files to download ... (cricket sounds)")
-            return
-
-        try:
-            with path(log_file_location).open() as f:
-                prev_msg = f.read()
-
-            now_msg = f"""
-===== {datetime.now().strftime(datetime_str)} =====
-
-Running isisdl version {__version__}
-
-Newly downloaded files:
-
-{chr(10).join(item.string_dump() for item in containers if item._newly_downloaded) or "None"}
-
-
-Newly discovered files:
-
-{chr(10).join(item.string_dump() for item in containers if item._newly_discovered) or "None"}
-
-
-
-"""
-
-            with path(log_file_location).open("w") as f:
-                f.write(now_msg)
-                f.write(prev_msg)
-
-            if len([item for item in containers if item._newly_downloaded or item._newly_discovered]) < 50:
-                print("".join(now_msg.splitlines(keepends=True)[4:]))
-            else:
-                print(f"Downloaded / Discovered too many files to list here. If you are interested please look at\n`{path(log_file_location)}`")
-
-        except OSError:
-            pass
-
-    def stream_files(self, files: Dict[MediaType, List[MediaContainer]], throttler: DownloadThrottler, status: DownloadStatus, session: SessionWithKey) -> None:
-        if is_windows or is_macos:
-            return
-
-        import pyinotify
-
-        class EventHandler(pyinotify.ProcessEvent):  # type: ignore[misc]
-            def __init__(self, files: List[MediaContainer], throttler: DownloadThrottler, session: SessionWithKey, **kwargs: Any):
-                self.session = session
-                self.throttler = throttler
-                self.files: Dict[Path, MediaContainer] = {file.path: file for file in files}
-
-                super().__init__(**kwargs)
-
-            def process_IN_OPEN(self, event: pyinotify.Event) -> None:
-                if event.dir:
-                    return
-
-                file = self.files.get(Path(event.pathname), None)
-                if file is not None and file.current_size is not None:
-                    return
-
-                if file is None:
-                    return
-
-                if file.current_size is not None:
-                    return
-
-                status.add_streaming(file)
-                file.download(self.throttler, self.session, True)
-                status.done_streaming()
-
-        wm = pyinotify.WatchManager()
-        notifier = pyinotify.Notifier(wm, EventHandler([item for row in files.values() for item in row], throttler, session))
-        wm.add_watch(str(path()), pyinotify.ALL_EVENTS, rec=True, auto_add=True)
-
-        notifier.loop()
-
-    def download_files(self, files: Dict[MediaType, List[MediaContainer]], throttler: DownloadThrottler, session: SessionWithKey, status: DownloadStatus) -> None:
-        # TODO: Dynamic calculation of num threads such that optimal Internet Usage is achieved
-        exception_lock = Lock()
-
-        def download(file: MediaContainer) -> bool:
-            if enable_multithread:
-                thread_id = int(current_thread().name.split("T_")[-1])
-            else:
-                thread_id = 0
-
-            status.add_container(thread_id, file)
-            try:
-                exit_ = file.download(throttler, session)
-                status.done(thread_id, file)
-                return exit_
-
-            except Exception as ex:
-                with exception_lock:
-                    generate_error_message(ex)
-
-        # TODO: Refactor this into a `sorted` expression with file.should_download as key.
-        first_files: List[MediaContainer] = []
-        second_files: List[MediaContainer] = []
-
-        for _files in files.values():
-            for file in _files:
-                if not file.should_download:
-                    first_files.append(file)
-                else:
-                    second_files.append(file)
-
-        if enable_multithread:
-            with ThreadPoolExecutor(args.max_num_threads, thread_name_prefix="T") as ex:
-                list(ex.map(download, first_files + second_files))
-        else:
-            for file in first_files + second_files:
-                download(file)
-
-    def _download_files(self, files: Dict[MediaType, List[MediaContainer]], throttler: DownloadThrottler, session: SessionWithKey, status: DownloadStatus) -> None:
-
-        # The threads only have to be re-filled once there is an item in ret_q.
-        # → The entire process could be blocking instead of active waiting
-        # → One could always store the bandwidth from before and evaluate on waking if there was a speedup
-
-        # We have to be explorative in + and - directions:
-        #   If we are currently at the maximum number of threads recorded, then sometimes just add a thread.
-
-        # Too many threads don't hurt: They just Make stopping the download slower.
-
-        # Maybe add in two phases: First download all small files → (Everything below 30M?), then the big one.
-        # Use the same algorithm but with the maximum number of threads doubled.
-
-        # TODO: Add extern + corrupted + documents
-        files_to_download = files[MediaType.video]
-        files_to_download.sort(key=lambda it: it.should_download)
-
-        ret_q: Queue[Tuple[int, bool]] = Queue()
-
-        if enable_multithread:
-            threads = [Downloader(Queue(), ret_q, i, status, throttler, session) for i in range(args.max_num_threads)]
-
-        else:
-            threads = [Downloader(Queue(), ret_q, 0, status, throttler, session)]
-
-        i = 0
-        for i in range(args.max_num_threads // 2):
-            threads[i].q.put(files_to_download.pop(0))
-
-        num_threads_downloading = i + 1
-
-        def eval_spawn_next_thread() -> Optional[bool]:
-            # TODO
-            # 2. Predict in which direction to 'jump'
-
-            weights: Dict[Optional[bool], float] = {False: 0.0, True: 0.0, None: 0.0}
-
-            # Score metric consisting of
-            #   - number of times already sampled
-            #   - Expected utility → Fewer threads = better
-            if num_threads_downloading + 1 in bandwidths:
-                weights[True] += -2 * math.log(num_times_counted[num_threads_downloading + 1]) + 2
-
-            else:
-                weights[True] += 3
-
-            if num_threads_downloading - 1 in bandwidths:
-                weights[False] += -2 * math.log(num_times_counted[num_threads_downloading - 1]) + 2
-
-            else:
-                weights[False] += 3
-
-            choice = random.choices(list(weights.keys()), list(weights.values()))
-            return choice[0]
-
-        bandwidths: Dict[int, float] = {}
-        num_times_counted: Dict[int, int] = {}
-        time_last_measurement = time.perf_counter()
-
-        while files_to_download:
-            thread_id_woken_up, was_successful = ret_q.get()
-
-            if was_successful:
-                # Measure the bandwidth
-                time_taken = min(time.perf_counter() - time_last_measurement, token_queue_bandwidths_save_for)
-                timestamps = [item for item in throttler.timestamps if time.perf_counter() - item < time_taken]
-
-                bandwidth_used = float(len(timestamps) * download_chunk_size / token_queue_bandwidths_save_for)
-
-                if num_threads_downloading not in bandwidths:
-                    bandwidths[num_threads_downloading] = bandwidth_used
-                    num_times_counted[num_threads_downloading] = len(timestamps)
-                else:
-                    bandwidths[num_threads_downloading] = bandwidths[num_threads_downloading] * (1 - bandwidth_download_files_mavg_perc) + bandwidth_used * bandwidth_download_files_mavg_perc
-                    num_times_counted[num_threads_downloading] += len(timestamps)
-
-            spawn = eval_spawn_next_thread()
-
-            if spawn is True and num_threads_downloading < args.max_num_threads:
-                threads[thread_id_woken_up].q.put(files_to_download.pop(0))
-                threads[num_threads_downloading].q.put(files_to_download.pop(0))
-                num_threads_downloading += 1
-
-            elif spawn is False and num_threads_downloading > 1:
-                num_threads_downloading -= 1
-
-            else:
-                threads[thread_id_woken_up].q.put(files_to_download.pop(0))
-
-            time_last_measurement = time.perf_counter()
-
-    @staticmethod
-    @on_kill(2)
-    def shutdown_running_downloads(*_: Any) -> None:
-        if not CourseDownloader.containers:
-            return
-
-        if args.stream:
-            return
-
-        for item in CourseDownloader.containers:
-            item.stop()
-
-        # Now wait for the downloads to finish
-        containers = CourseDownloader.containers
-
-        while not all(item._done for item in containers):
-            time.sleep(status_time)
-
-        CourseDownloader.message_what_did_i_do(containers)
 
 
 def maybe_create_log_file() -> None:

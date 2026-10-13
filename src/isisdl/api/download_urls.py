@@ -3,16 +3,17 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import cast
 from urllib.parse import urlparse
 
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.orm import Session as DatabaseSession
 
 from isisdl.api.endpoints import VideoListAPI, DocumentListAPI, AssignmentAPI
@@ -20,10 +21,10 @@ from isisdl.api.models import MediaContainer, MediaURL, AuthenticatedSession, Co
 from isisdl.api.rate_limiter import RateLimiter, ThrottleType, Token
 from isisdl.backend.models import Config
 from isisdl.db_conf import add_or_update_objects_to_database
-from isisdl.settings import discover_num_threads, perc_diff_for_checksum, intern_dir_location
-from isisdl.utils import path, sanitize_name, calculate_local_checksum, parse_google_drive_url, get_url_from_gdrive_confirmation, HumanBytes
+from isisdl.settings import discover_num_threads, perc_diff_for_checksum, intern_dir_location, legacy_database_file_location
+from isisdl.utils import path, sanitize_name, calculate_local_checksum, parse_google_drive_url, get_url_from_gdrive_confirmation, HumanBytes, do_ffprobe, config as legacy_config
 
-__all__ = ["download_media_urls"]
+__all__ = ["download_media_urls", "sync_media_urls"]
 
 
 async def gather_media_urls(db: DatabaseSession, session: AuthenticatedSession, courses: list[Course], config: Config) -> list[MediaURL]:
@@ -71,7 +72,11 @@ def read_media_containers(db: DatabaseSession) -> dict[tuple[int, str], MediaCon
 
 
 def course_directory(course: Course) -> str:
-    return sanitize_name(course.preferred_name or course.short_name, True)
+    # Courses can still only be renamed with the 1.3 config (`isisdl --config`). Its json keys are strings.
+    renamed = legacy_config.renamed_courses or {}
+    name = renamed.get(str(course.id)) or renamed.get(course.id)  # type: ignore[call-overload]
+
+    return sanitize_name(name or course.preferred_name or course.short_name, True)
 
 
 def relative_directory(media_url: MediaURL, config: Config) -> str:
@@ -193,7 +198,8 @@ def resolve_conflicts(downloads: list[Download]) -> list[Download]:
     for it in downloads:
         same_file[(it.media_url.course_id, it.name, it.size)].append(it)
 
-    final, remaining = [], []
+    final: list[Download] = []
+    remaining: list[Download] = []
     for group in same_file.values():
         first, *others = sorted(group, key=order)
         first.links.extend(other for other in others if other.path != first.path)
@@ -262,6 +268,20 @@ def adopt_existing_locations(downloads: list[Download], config: Config) -> None:
             it.relative_path = legacy_directory
 
 
+def size_before_compression(file: Path) -> int | None:
+    """
+    `isisdl --compress` stores the size of the original video in the metadata of the compressed one.
+    """
+    probe = do_ffprobe(file)
+    if probe is None:
+        return None
+
+    try:
+        return int(str(probe["format"]["tags"]["previous_size"]).strip("\""))
+    except (KeyError, ValueError):
+        return None
+
+
 def needs_download(it: Download, container: MediaContainer | None) -> bool:
     if not it.path.exists():
         return True
@@ -272,6 +292,11 @@ def needs_download(it: Download, container: MediaContainer | None) -> bool:
 
     if actual_size == it.size or (container is not None and container.size == actual_size):
         return False
+
+    if it.media_type == MediaType.video:
+        original_size = size_before_compression(it.path)
+        if original_size is not None and (original_size == it.size or (container is not None and container.size == original_size)):
+            return False
 
     if container is None or container.checksum is None:
         return True
@@ -328,6 +353,23 @@ def link(source: Download, target: Download) -> None:
     os.link(source.path, target.path)
 
 
+def read_legacy_checksums() -> dict[tuple[int, str], tuple[int, str]]:
+    """
+    The checksums that isisdl 1.3 calculated, by (course id, url). This saves reading every file again when migrating.
+    """
+    try:
+        legacy = sqlite3.connect(f"file:{path(legacy_database_file_location)}?mode=ro", uri=True)
+        try:
+            rows = legacy.execute("SELECT course_id, url, size, checksum FROM fileinfo WHERE checksum IS NOT NULL").fetchall()
+        finally:
+            legacy.close()
+
+    except sqlite3.Error:
+        return {}
+
+    return {(course_id, url): (size, checksum) for course_id, url, size, checksum in rows}
+
+
 def store_containers(db: DatabaseSession, downloads: list[tuple[Download, str | None]]) -> list[MediaContainer] | None:
     existing = read_media_containers(db)
 
@@ -340,16 +382,17 @@ def store_containers(db: DatabaseSession, downloads: list[tuple[Download, str | 
             }
             for it, checksum in downloads
         ],
-        MediaContainer, lambda x: (x["course_id"], x["url"]),
+        MediaContainer, lambda x: (cast(int, x["course_id"]), cast(str, x["url"])),
         {key: key for key in ["url", "course_id", "download_url", "media_type", "relative_path", "name", "size", "time_created", "time_modified", "checksum"]},
         {}
     )
 
 
-async def download_media_urls(db: DatabaseSession, session: AuthenticatedSession, urls: list[MediaURL], config: Config) -> list[MediaContainer]:
+async def download_media_urls(db: DatabaseSession, session: AuthenticatedSession, urls: list[MediaURL], config: Config, should_download: bool = True) -> list[MediaContainer]:
     """
     Downloads all files that are missing or changed and records them as MediaContainers.
     Files that already exist with the expected size (e.g. downloaded by isisdl 1.3) are not downloaded again.
+    With `should_download=False`, only the files that exist are recorded and nothing on disk is changed.
     Returns the MediaContainers that were newly downloaded.
     """
     containers = read_media_containers(db)
@@ -374,7 +417,18 @@ async def download_media_urls(db: DatabaseSession, session: AuthenticatedSession
     adopt_existing_locations(downloads + [target for it in downloads for target in it.links], config)
 
     to_download = [it for it in downloads if needs_download(it, containers.get((it.media_url.course_id, it.media_url.url)))]
-    print(f"Found {len(resolved)} files: {len(to_download)} to download ({HumanBytes.format_str(sum(it.size for it in to_download))}), {len(corrupted)} are not downloadable.")
+    print(f"Found {len(resolved)} files: {len(to_download)} {'to download' if should_download else 'missing or changed'} ({HumanBytes.format_str(sum(it.size for it in to_download))}), {len(corrupted)} are not downloadable.")
+
+    if not should_download:
+        missing = {id(it) for it in to_download}
+        stored: list[tuple[Download, str | None]] = [(it, None) for it in corrupted]
+        for it in downloads:
+            for target in [it, *it.links]:
+                if id(target) not in missing and target.path.exists():
+                    stored.append((target, calculate_local_checksum(target.path)))
+
+        store_containers(db, stored)
+        return []
 
     limiter = RateLimiter.from_bandwidth(config.dl_throttle_rate) if config.dl_throttle_rate else RateLimiter(None)
 
@@ -388,15 +442,25 @@ async def download_media_urls(db: DatabaseSession, session: AuthenticatedSession
 
     newly_downloaded = {id(it) for it, ok in zip(to_download, results) if ok}
     failed = {id(it) for it, ok in zip(to_download, results) if not ok}
+    legacy_checksums = read_legacy_checksums() if any((it.media_url.course_id, it.media_url.url) not in containers for it in downloads) else {}
 
     def checksum_of(it: Download) -> str | None:
-        container = containers.get((it.media_url.course_id, it.media_url.url))
+        key = (it.media_url.course_id, it.media_url.url)
+        container = containers.get(key)
         if id(it) not in newly_downloaded and container is not None and container.checksum is not None:
             return container.checksum
 
-        return calculate_local_checksum(it.path) if it.path.exists() else None
+        if not it.path.exists():
+            return None
 
-    stored: list[tuple[Download, str | None]] = [(it, None) for it in corrupted]
+        if id(it) not in newly_downloaded and key in legacy_checksums:
+            size, checksum = legacy_checksums[key]
+            if size == it.path.stat().st_size:
+                return checksum
+
+        return calculate_local_checksum(it.path)
+
+    stored = [(it, None) for it in corrupted]
     for it in downloads:
         if id(it) in failed:
             continue
@@ -414,3 +478,30 @@ async def download_media_urls(db: DatabaseSession, session: AuthenticatedSession
 
     new_containers = read_media_containers(db)
     return [new_containers[(it.media_url.course_id, it.media_url.url)] for it in to_download if id(it) in newly_downloaded]
+
+
+async def sync_media_urls(db: DatabaseSession, session: AuthenticatedSession, urls: list[MediaURL], config: Config) -> None:
+    """
+    Rebuilds the records of the downloaded files from what is on disk. Nothing is downloaded or deleted.
+    Files that are missing or changed are downloaded on the next run.
+    """
+    db.execute(delete(MediaContainer))
+    db.commit()
+
+    await download_media_urls(db, session, urls, config, should_download=False)
+
+    containers = read_media_containers(db).values()
+    known = {path(course_directory(it.course), it.relative_path, it.name) for it in containers}
+    course_dirs = {path(course_directory(it.course)) for it in urls}
+    unknown = sorted(file for course_dir in course_dirs if course_dir.is_dir() for file in course_dir.rglob("*") if file.is_file() and file not in known)
+
+    print(f"Recorded {sum(it.media_type != MediaType.corrupted for it in containers)} files that exist on disk.")
+    if not unknown:
+        return
+
+    print(f"\n{len(unknown)} files in the course directories do not belong to any file on ISIS ({HumanBytes.format_str(sum(it.stat().st_size for it in unknown))}):")
+    for file in unknown[:50]:
+        print(f"  {file}")
+
+    if len(unknown) > 50:
+        print(f"  … and {len(unknown) - 50} more")

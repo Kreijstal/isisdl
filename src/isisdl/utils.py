@@ -76,7 +76,6 @@ def get_args() -> argparse.Namespace:
     if not is_windows:
         operations.add_argument("--export-config", help=f"Exports the config to {export_config_file_location}.", action="store_true")
 
-    operations.add_argument("--stream", help="Launches isisdl in streaming mode. Will watch for file accesses and download only those files.", action="store_true")
     operations.add_argument("--update", help="Checks if an update is available and installs it.", action="store_true")
     operations.add_argument("--delete-bad-urls", help="Deletes all urls deemed to be \"bad\" - meaning there is no content.", action="store_true")
     operations.add_argument("--download-diff", help="Checks if a given directory contains more / different content than downloaded from isisdl.", type=str)

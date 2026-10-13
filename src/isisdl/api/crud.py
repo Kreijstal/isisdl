@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session as DatabaseSession
 from isisdl.api.models import AuthenticatedSession, Course, MediaURL
 from isisdl.backend.models import User, Config
 from isisdl.db_conf import add_or_update_objects_to_database
+from isisdl.utils import config as legacy_config
 from isisdl.version import __version__
 
 
@@ -101,6 +102,15 @@ def parse_courses_from_API(db: DatabaseSession, courses: list[dict[str, Any]], c
         {"time_of_last_access": datetime.fromtimestamp, "time_of_last_modification": datetime.fromtimestamp, "time_of_start": datetime.fromtimestamp, "time_of_end": datetime.fromtimestamp},
         {"preferred_name"}
     )
+
+
+def filter_courses(courses: list[Course]) -> list[Course]:
+    """
+    The courses can still only be white- and blacklisted with the 1.3 config (`isisdl --config`).
+    """
+    whitelist, blacklist = legacy_config.whitelist, legacy_config.blacklist
+
+    return [it for it in courses if (whitelist is None or it.id in whitelist) and (blacklist is None or it.id not in blacklist)]
 
 
 def read_courses(db: DatabaseSession) -> list[Course]:

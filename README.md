@@ -41,12 +41,6 @@ database and be able to recover the files.
 
 Read in the [wiki](https://github.com/Emily3403/isisdl/wiki/Compression) for further details on how it is implemented.
 
-### Support for prioritizing downloads
-
-Once you open any file in the `~/isisdl` directory, this download will be prioritized, if it isn't downloaded already.
-This is especially useful, if you either don't want to download all video files, but still be able to view them
-with `vlc` (see the `--stream` option), or if you want to start watching videos while the download is still running.
-
 ## Installation
 
 ### Linux
@@ -81,9 +75,8 @@ If you are having problems see the
 - `--help`: Displays a helpful message.
 - `--init`: Will guide you through the base configuration.
 - `--config`: Will guide you through additional configuration.
-- `--sync`: Will synchronize the local database with ISIS.
+- `--sync`: Rebuilds the database from the files on disk, without downloading or deleting anything.
 - `--compress`: Launches `ffmpeg` and compresses videos.
-- `--stream`: Launches `isisdl` in streaming mode.
 
 [//]: # (- `--subscribe`: Subscribes you to *all* publicly available courses)
 

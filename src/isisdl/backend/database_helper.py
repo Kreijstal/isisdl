@@ -20,6 +20,7 @@ from isisdl.settings import database_file_location, legacy_database_file_locatio
 
 if TYPE_CHECKING:
     from isisdl.backend.request_helper import MediaContainer
+    from isisdl.compress import VideoFile
 
 
 @dataclass
@@ -123,6 +124,16 @@ class DatabaseHelper:
                 url text primary key unique,
                 last_checked int,
                 times_checked int
+                )
+            """)
+
+            # The bookkeeping of `isisdl --compress`
+            self.cur.execute("""
+                CREATE TABLE IF NOT EXISTS json_strings
+
+                (
+                id text primary key unique,
+                json text
                 )
             """)
 
@@ -327,7 +338,7 @@ class DatabaseHelper:
 
     # TODO: Fix this
 
-    def update_inefficient_videos(self, file: MediaContainer, estimated_efficiency: float) -> None:
+    def update_inefficient_videos(self, file: VideoFile, estimated_efficiency: float) -> None:
         with self.lock:
             _data = self.cur.execute("SELECT json FROM json_strings where id=\"inefficient_videos\"").fetchone()
             if _data is None or len(_data) == 0:
@@ -364,7 +375,7 @@ class DatabaseHelper:
             self.con.commit()
 
     @staticmethod
-    def make_inefficient_file_name(file: MediaContainer) -> str:
+    def make_inefficient_file_name(file: VideoFile) -> str:
         return f"{file.course.course_id} {file._name}"
 
     def filetable_exists(self) -> bool:

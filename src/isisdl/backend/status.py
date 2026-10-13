@@ -6,13 +6,12 @@ import time
 from datetime import datetime, timedelta
 from threading import Thread, Lock
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
-from urllib.parse import urlparse
 
-from isisdl.settings import status_chop_off, is_windows, status_time, status_progress_bar_resolution, is_testing, course_pad_minimum_width, hostname_pad_minimum_width
-from isisdl.utils import clear, HumanBytes, args, MediaType, DownloadThrottler
+from isisdl.settings import status_chop_off, is_windows, status_time, status_progress_bar_resolution, is_testing
+from isisdl.utils import clear, MediaType
 
 if TYPE_CHECKING:
-    from isisdl.backend.request_helper import MediaContainer, PreMediaContainer, RequestHelper, MediaContainerSize
+    from isisdl.backend.request_helper import MediaContainer, PreMediaContainer, RequestHelper
 
 
 def maybe_chop_off_str(st: str, width: int) -> str:
@@ -186,87 +185,3 @@ class CompressStatusUwU(Status):
 
     def __init__(self, files: List[MediaContainer], helper: RequestHelper) -> None:
         super().__init__("Compressing files", len(files))
-
-
-class DownloadStatus(Status):
-    _show_progress_bar = False
-    _show_eta = False
-
-    def __init__(self, files: List[MediaContainer], num_threads: int, throttler: DownloadThrottler):
-        self.files = files
-        self.finished_files = 0
-        self.total_downloaded = 0
-
-        self.num_threads = num_threads
-        self.throttler = throttler
-
-        self.thread_files: Dict[int, Optional[MediaContainer]] = {i: None for i in range(num_threads)}
-        self.stream_file: Optional[MediaContainer] = None
-        super().__init__("Downloading content", total=len(self.files))
-
-    def add_container(self, thread_id: int, container: MediaContainer) -> None:
-        self.thread_files[thread_id] = container
-
-    def add_streaming(self, container: MediaContainer) -> None:
-        self.stream_file = container
-
-    def done_streaming(self) -> None:
-        self.stream_file = None
-
-    def done(self, thread_num: int, container: MediaContainer, *args: Any, **kwargs: Any) -> None:  # type: ignore
-        with self._lock:
-            item = self.thread_files[thread_num]
-            self.thread_files[thread_num] = None
-
-            if item is None:
-                return
-
-            self.finished_files += 1
-
-            if item.current_size is not None:
-                self.total_downloaded += item.current_size
-            elif item._stop and item.size == MediaContainerSize.in_bytes and item.size.val is not None:
-                self.total_downloaded += item.size.val
-
-    def generate_log_message(self) -> List[str]:
-        log_strings = []
-
-        # total_size = sum(item.size for item in self.files if item.size != -1)
-        downloaded_bytes = self.total_downloaded + sum(item.current_size for item in self.thread_files.values() if item is not None and item.current_size is not None)
-        curr_bandwidth = HumanBytes.format_str(self.throttler.bandwidth_used)
-
-        log_strings.append("")
-        log_strings.append(
-            f"Current bandwidth usage: "
-            f"{curr_bandwidth}/s {f'(limited to {self.throttler.download_rate} MiB/s)' if self.throttler.download_rate != -1 else ''}"
-        )
-
-        # General meta-info
-        log_strings.append(f"Downloaded {HumanBytes.format_str(downloaded_bytes)}")  # / {HumanBytes.format_str(total_size)}
-        log_strings.append(f"Finished:  {self.finished_files} / {len(self.files)} files")
-        # log_strings.append(f"Done in: {timedelta(seconds=int((total_size - downloaded_bytes) / max(self.throttler.bandwidth_used, 1)))}")
-        log_strings.append("")
-
-        # Now determine the already downloaded amount and display it
-        course_pad = max(max(len(str(item.course)) if item is not None else 1 for item in self.thread_files.values()), course_pad_minimum_width)
-        hostname_pad = max(max(len(urlparse(item.url).hostname or "") if item is not None else 1 for item in self.thread_files.values()), hostname_pad_minimum_width)
-
-        for thread_id, container in self.thread_files.items():
-            if container is None:
-                if args.stream is False:
-                    log_strings.append("")
-                continue
-
-            log_strings.append(container.render_status(course_pad, hostname_pad))
-
-        # Optional streaming info
-        if self.stream_file is not None:
-            if args.stream is False:
-                log_strings.extend(("", ""))
-
-            log_strings.append(self.stream_file.render_status(stream=True))
-
-        if args.stream and self.stream_file is None:
-            log_strings.append("Stream: Waiting")
-
-        return log_strings

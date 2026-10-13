@@ -9,18 +9,71 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from statistics import variance, stdev, mean
 from threading import Thread, Lock
 from typing import Optional, List, Dict, Any, Tuple
 
-from isisdl.backend.crypt import get_credentials
-from isisdl.backend.request_helper import RequestHelper, MediaContainer
-from isisdl.backend.status import print_log_messages, RequestHelperStatus
+from sqlalchemy import select
+
+from isisdl.api.download_urls import course_directory
+from isisdl.api.models import MediaContainer, MediaType
+from isisdl.backend.status import print_log_messages
+from isisdl.db_conf import DatabaseSessionMaker
 from isisdl.settings import is_windows, has_ffmpeg, status_time, ffmpeg_args, enable_multithread, compress_duration_for_to_low_efficiency, compress_std_mavg_size, \
     compress_minimum_stdev, compress_minimum_score, compress_score_mavg_size, compress_insta_kill_score, compress_duration_for_insta_kill, is_first_time, error_text
-from isisdl.utils import on_kill, HumanBytes, do_ffprobe, generate_error_message, OnKill, database_helper, MediaType
+from isisdl.utils import on_kill, HumanBytes, do_ffprobe, generate_error_message, OnKill, database_helper, path
+
+
+@dataclass
+class VideoCourse:
+    course_id: int
+    name: str
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass
+class VideoFile:
+    """
+    A downloaded video. `size` is the size of the download, `links` are the other paths that are hardlinked to the same file.
+    """
+    path: Path
+    size: int
+    course: VideoCourse
+    _name: str
+    links: list[Path] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        return self._name
+
+
+def read_downloaded_videos() -> tuple[list[VideoFile], list[VideoCourse]]:
+    """
+    Every video on disk once: Hardlinked copies of it are attached as links.
+    """
+    with DatabaseSessionMaker() as db:
+        containers = db.execute(select(MediaContainer).where(MediaContainer.media_type == MediaType.video)).scalars().all()
+
+        courses: dict[int, VideoCourse] = {}
+        files: dict[tuple[int, int], VideoFile] = {}
+        for it in sorted(containers, key=lambda it: (it.course_id, it.relative_path, it.name)):
+            course = courses.setdefault(it.course_id, VideoCourse(it.course_id, course_directory(it.course)))
+            file = path(course.name, it.relative_path, it.name)
+            if not file.exists():
+                continue
+
+            stat = file.stat()
+            existing = files.get((stat.st_dev, stat.st_ino))
+            if existing is None:
+                files[(stat.st_dev, stat.st_ino)] = VideoFile(file, it.size, course, it.name)
+            elif file != existing.path:
+                existing.links.append(file)
+
+    return list(files.values()), list(courses.values())
 
 
 def check_ffmpeg_exists() -> None:
@@ -64,7 +117,7 @@ def format_seconds(seconds: float) -> str:
     return "%02i:%02i:%02i" % (hours, minutes, seconds)
 
 
-def make_temp_filename(file: MediaContainer) -> str:
+def make_temp_filename(file: VideoFile) -> str:
     head, tail = os.path.split(file.path)
     return os.path.join(head, ".tmp_" + tail)
 
@@ -135,10 +188,10 @@ def covariance(x: List[int], y: List[float]) -> float:
 
 # TODO: Migrate this to Status
 class CompressStatus(Thread):
-    files: List[MediaContainer]
-    helper: RequestHelper
+    files: List[VideoFile]
+    courses: List[VideoCourse]
 
-    cur_file: Optional[MediaContainer]
+    cur_file: Optional[VideoFile]
     cur_file_probe: Optional[Dict[str, Any]]
     ffmpeg: Optional[subprocess.Popen[str]]
     start_time_for_video: Optional[float]
@@ -155,9 +208,9 @@ class CompressStatus(Thread):
 
     __slots__ = tuple(__annotations__)
 
-    def __init__(self, files: List[MediaContainer], helper: RequestHelper) -> None:
+    def __init__(self, files: List[VideoFile], courses: List[VideoCourse]) -> None:
         self.files = files
-        self.helper = helper
+        self.courses = courses
         self.lock = Lock()
 
         self._running = True
@@ -232,7 +285,7 @@ class CompressStatus(Thread):
 
             self.total_files_done += 1
 
-    def start_thing(self, file: MediaContainer, ffmpeg: subprocess.Popen[str]) -> None:
+    def start_thing(self, file: VideoFile, ffmpeg: subprocess.Popen[str]) -> None:
         with self.lock:
             self.cur_file = file
             self.cur_file_probe = do_ffprobe(file.path)
@@ -389,7 +442,7 @@ class CompressStatus(Thread):
             generate_error_message(ex)
 
     def generate_final_message(self) -> None:
-        course_name_mapping = {course.course_id: course.name for course in self.helper.courses}
+        course_name_mapping = {course.course_id: course.name for course in self.courses}
 
         infos = {course.course_id: {
             "total_size": 0,
@@ -397,7 +450,7 @@ class CompressStatus(Thread):
             "size_skipped": 0,
             "num_processed": 0,
             "num_skipped": 0,
-        } for course in self.helper.courses if any((file.course.course_id == course.course_id for file in self.files))}
+        } for course in self.courses if any((file.course.course_id == course.course_id for file in self.files))}
 
         inefficient = database_helper.get_inefficient_videos()
 
@@ -419,7 +472,7 @@ class CompressStatus(Thread):
 
         try:
             max_processed_file_len = max(len(str(info["num_processed"])) for info in infos.values())
-            max_course_name_len = max(len(str(course)) for course in self.helper.courses)
+            max_course_name_len = max(len(str(course)) for course in self.courses)
         except ValueError:
             max_processed_file_len, max_course_name_len = 0, 0
 
@@ -445,7 +498,7 @@ class CompressStatus(Thread):
         print_log_messages(log_strings, 0)
 
 
-def compress(files: List[MediaContainer]) -> None:
+def compress(files: List[VideoFile]) -> None:
     assert compress_status is not None
 
     try:
@@ -490,6 +543,11 @@ def compress(files: List[MediaContainer]) -> None:
             if ret_code == 0:
                 os.replace(tmp_file_name, file.path)
 
+                # Keep the hardlinked copies pointing to the same file
+                for link in file.links:
+                    link.unlink(missing_ok=True)
+                    os.link(file.path, link)
+
             else:
                 try:
                     os.remove(tmp_file_name)
@@ -508,30 +566,31 @@ def main() -> None:
     global compress_thread
     global total_time_for_compression
 
-    print("Unfortunately, breaking changes to the database have broken this program and it is not yet fixed ...")
-    sys.exit(1)
+    check_ffmpeg_exists()
 
-    if is_first_time:  # type: ignore
+    if is_first_time:
         print("\nAttention: Dont rename your video files please!")
         print("Press enter to continue ...\n")
         input()
 
     total_time_for_compression = database_helper.get_total_time_compressing()
-    user = get_credentials()
-    with RequestHelperStatus() as status:
-        helper = RequestHelper(user, status)
-        content = [item for item in helper.download_content(status)[MediaType.video] if item.path.exists() and item.path.stat().st_size == item.size]
+    videos, courses = read_downloaded_videos()
+    if not videos:
+        print("There are no downloaded videos to compress. Run `isisdl` first to download them.")
+        return
+
+    # Only videos that have not been compressed yet
+    content = [item for item in videos if item.path.stat().st_size == item.size]
 
     print("\n\nProcessing ...\n")
 
     if enable_multithread:
         with ThreadPoolExecutor(os.cpu_count()) as ex:
-            _ffprobes = list(ex.map(lambda x: do_ffprobe(x.path), content))
+            ffprobes = list(ex.map(lambda x: do_ffprobe(x.path), content))
     else:
-        _ffprobes = [do_ffprobe(item.path) for item in content]
+        ffprobes = [do_ffprobe(item.path) for item in content]
 
-    ffprobes = filter(lambda x: x is not None, _ffprobes)
-    content_and_score: List[Tuple[MediaContainer, int]] = []
+    content_and_score: List[Tuple[VideoFile, int]] = []
     # TODO: Get rid of this.
     to_inefficient = database_helper.get_inefficient_videos()
     already_h265 = []
@@ -557,7 +616,7 @@ def main() -> None:
         content_and_score.append((con, int(vid_probe["bit_rate"])))
 
     content = [item for item, _ in sorted(content_and_score, key=lambda pair: pair[1], reverse=True)]
-    compress_status = CompressStatus(content + inefficient_videos + already_h265, helper)
+    compress_status = CompressStatus(content + inefficient_videos + already_h265, courses)
     compress_status.start()
 
     # Run the conversion in a separate thread so, if killed, it will still run
