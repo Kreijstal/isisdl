@@ -47,6 +47,10 @@ class BadUrl:
         return bool(time.time() > self.last_checked + (self.times_checked * bad_url_cache_reeval_times_mul) ** bad_url_cache_reeval_exp * bad_url_cache_reeval_static_mul)
 
 
+# The static salt and iteration count that isisdl <= 1.3 derives its keys with
+legacy_key_parameters = (b"salty~salt", 390_000)
+
+
 def derive_key(password: str, salt: bytes, iterations: int) -> bytes:
     kdf = PBKDF2HMAC(algorithm=password_hash_algorithm(), length=password_hash_length, salt=salt, iterations=iterations)
     return base64.urlsafe_b64encode(kdf.derive(password.encode()))
@@ -143,19 +147,13 @@ class DatabaseHelper:
         legacy_config["salt"] = secrets.token_urlsafe(random_salt_length)
 
         # 1.3 derives the key with a static salt and fewer iterations, so the password is re-encrypted with the new parameters.
-        # A passphrase-protected password cannot be re-encrypted without the passphrase: then only the username is kept.
-        password = None
+        # A passphrase-protected password cannot be re-encrypted without the passphrase: it is kept as is and `decryptor` falls back to the 1.3 key.
         if legacy_config.get("password") is not None and not legacy_config.get("password_encrypted"):
             try:
-                password = Fernet(derive_key(master_password, b"salty~salt", 390_000)).decrypt(legacy_config["password"].encode()).decode()
+                password = Fernet(derive_key(master_password, *legacy_key_parameters)).decrypt(legacy_config["password"].encode()).decode()
+                legacy_config["password"] = Fernet(derive_key(master_password, legacy_config["salt"].encode(), password_hash_iterations)).encrypt(password.encode()).decode()
             except InvalidToken:
-                pass
-
-        if password is None:
-            legacy_config["password"] = None
-            legacy_config["password_encrypted"] = False
-        else:
-            legacy_config["password"] = Fernet(derive_key(master_password, legacy_config["salt"].encode(), password_hash_iterations)).encrypt(password.encode()).decode()
+                legacy_config["password"] = None
 
         with self.lock:
             self.cur.executemany("INSERT OR IGNORE INTO config VALUES (?, ?)", [(key, json.dumps(value)) for key, value in legacy_config.items()])

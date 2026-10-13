@@ -8,6 +8,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from isisdl.settings import password_hash_algorithm, password_hash_length, password_hash_iterations, env_var_name_username, env_var_name_password, is_autorun, master_password, error_text
+from isisdl.backend.database_helper import derive_key, legacy_key_parameters
 from isisdl.utils import User, config, logger, database_helper
 
 # TODO: Also make the caching work for when the password is entered manually
@@ -34,10 +35,12 @@ def encryptor(password: str, content: str) -> str:
 
 
 def decryptor(password: str, content: str) -> Optional[str]:
-    key = generate_key(password)
-
-    try:
-        decrypted = Fernet(key).decrypt(content.encode()).decode()
+    # Passphrase-protected passwords imported from isisdl <= 1.3 are still encrypted with the 1.3 key.
+    for key in [generate_key(password), derive_key(password, *legacy_key_parameters)]:
+        try:
+            decrypted = Fernet(key).decrypt(content.encode()).decode()
+        except InvalidToken:
+            continue
 
         # Only cache the entry if it got successfully decrypted
         global last_password
@@ -45,8 +48,7 @@ def decryptor(password: str, content: str) -> Optional[str]:
 
         return decrypted
 
-    except InvalidToken:
-        return None
+    return None
 
 
 def store_user(user: User, password: Optional[str] = None) -> None:

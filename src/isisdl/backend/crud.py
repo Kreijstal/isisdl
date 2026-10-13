@@ -21,10 +21,14 @@ def store_user(db: DatabaseSession, username: str, password: str, user_id: int, 
     if the_password_to_encrypt is None:
         return None
 
-    key = generate_key(the_password_to_encrypt, config)
+    return add_object_to_database(db, make_user(username, password, user_id, the_password_to_encrypt, config))
+
+
+def make_user(username: str, password: str, user_id: int, password_to_encrypt: str, config: Config) -> User:
+    key = generate_key(password_to_encrypt, config)
     encrypted_password = Fernet(key).encrypt(password.encode()).decode()
 
-    return add_object_to_database(db, User(username=username, encrypted_password=encrypted_password, user_id=user_id))
+    return User(username=username, encrypted_password=encrypted_password, user_id=user_id)
 
 
 def create_default_config(db: DatabaseSession) -> Config | None:
@@ -70,19 +74,22 @@ def create_config_from_legacy(db: DatabaseSession) -> Config | None:
     ))
 
 
-async def store_user_with_lookup(db: DatabaseSession, username: str, password: str, config: Config) -> User | None:
+async def lookup_user_id(username: str, password: str) -> int | None:
     """
-    Logs in to look up the ISIS user id, which is the primary key of the user, and stores the user.
+    Logs in to look up the ISIS user id, which is the primary key of the user.
     """
     session = await authenticate_with_password(username, password)
     if session is None:
         return None
 
     try:
-        user_id = await UserIDAPI.get(session)
+        return await UserIDAPI.get(session)
     finally:
         await session.close()
 
+
+async def store_user_with_lookup(db: DatabaseSession, username: str, password: str, config: Config) -> User | None:
+    user_id = await lookup_user_id(username, password)
     if user_id is None:
         return None
 
@@ -99,16 +106,22 @@ async def read_or_migrate_user(db: DatabaseSession, config: Config) -> User | No
     Returns the user from the new database. If there is none yet, the credentials of the 1.3 config are migrated
     (environment variables take precedence, see `get_credentials`).
     Passphrase-protected credentials are not migrated, since the new config cannot store them yet.
+    Instead, the passphrase is asked for and the user is only kept in memory for this run.
+    Returns None if the credentials are wrong.
     """
     user = read_user(db)
     if user is not None:
         return user
 
-    if legacy.password_encrypted and not (os.getenv(env_var_name_username) and os.getenv(env_var_name_password)):
+    legacy_user = get_credentials()
+    if not legacy.password_encrypted or (os.getenv(env_var_name_username) and os.getenv(env_var_name_password)):
+        return await store_user_with_lookup(db, legacy_user.username, legacy_user.password, config)
+
+    user_id = await lookup_user_id(legacy_user.username, legacy_user.password)
+    if user_id is None:
         return None
 
-    legacy_user = get_credentials()
-    return await store_user_with_lookup(db, legacy_user.username, legacy_user.password, config)
+    return make_user(legacy_user.username, legacy_user.password, user_id, master_password, config)
 
 
 def read_or_create_config(db: DatabaseSession) -> Config:

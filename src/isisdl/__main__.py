@@ -9,7 +9,6 @@ from isisdl.api.endpoints import UserCourseListAPI
 from isisdl.backend import sync_database
 from isisdl.backend.config import init_wizard, config_wizard
 from isisdl.backend.crud import read_or_create_config, read_or_migrate_user
-from isisdl.backend.request_helper import CourseDownloader
 from isisdl.db_conf import init_database, DatabaseSessionMaker
 from isisdl.settings import is_first_time, is_static, forbidden_chars, has_ffmpeg, fstype, is_windows, working_dir_location, python_executable, is_macos, is_online
 from isisdl.utils import args, acquire_file_lock_or_exit, generate_error_message, install_latest_version, export_config, database_helper, config, migrate_database, Config, compare_download_diff
@@ -32,36 +31,38 @@ database_version = {Config.default("database_version")}
 """)
 
 
-async def _new_main() -> None:
+async def _new_main() -> bool:
     with DatabaseSessionMaker() as db:
         config = read_or_create_config(db)
         user = await read_or_migrate_user(db, config)
         if user is None:
-            return
+            print("I could not log in to ISIS. You have probably entered the wrong credentials.\nRerun me with `isisdl --init` to re-store them.")
+            return False
 
         session = await authenticate_new_session(user, config)
-
         if session is None:
-            return
+            print(f"I could not log in to ISIS as \"{user.username}\". You have probably entered the wrong credentials.\nRerun me with `isisdl --init` to re-store them.")
+            return False
 
-        courses = await UserCourseListAPI.get(db, session, user, config)
-        # courses = read_courses(db)
-        if courses is None:
-            return
+        try:
+            courses = await UserCourseListAPI.get(db, session, user, config)
+            if courses is None:
+                print("I could not get your courses from ISIS.")
+                return False
 
-        urls = await gather_media_urls(db, session, courses, config)
-        # if urls is None:
-        #     return
+            urls = await gather_media_urls(db, session, courses, config)
+            await download_media_urls(db, session, urls, config)
 
-        await download_media_urls(db, session, urls, config)
+            # TODO: How to deal with crashing threads
+            #   - Have a menu which enables 3 choices:
+            #     - restart with same file
+            #     - restart with next file
+            #     - ignore and keep the thread dead
 
-        # TODO: How to deal with crashing threads
-        #   - Have a menu which enables 3 choices:
-        #     - restart with same file
-        #     - restart with next file
-        #     - ignore and keep the thread dead
+        finally:
+            await session.close()
 
-        await session.close()
+    return True
 
 
 def _main() -> None:
@@ -84,7 +85,6 @@ Please press enter to continue.
         input()
         init_wizard()
         config_wizard()
-        sync_database.main()
 
     elif database_helper.get_database_version() < config.default("database_version"):
         if migrate_database() is False:
@@ -119,8 +119,6 @@ Please press enter to continue.
     if not is_online:
         print("I cannot establish an internet connection.")
         sys.exit(1)
-
-    asyncio.run(_new_main())
 
     install_latest_version()
 
@@ -167,7 +165,9 @@ Please press enter to continue.
 
     else:
         # Main routine
-        CourseDownloader().start()
+        if not asyncio.run(_new_main()):
+            sys.exit(1)
+
         print("\nDone! Have a nice day ^.^")
 
 
