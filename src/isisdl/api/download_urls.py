@@ -307,6 +307,28 @@ def needs_download(it: Download, container: MediaContainer | None) -> bool:
     return calculate_local_checksum(it.path) != container.checksum
 
 
+def prefer_existing_copies(downloads: list[Download], containers: dict[tuple[int, str], MediaContainer]) -> None:
+    """
+    The file chosen to be downloaded may be missing although one of the paths it is hardlinked to already has it
+    (e.g. 1.3 left an empty file in last semester's course, but downloaded the same video in this semester's one).
+    Then that copy is used as the source: Nothing is downloaded and the other paths are linked to it.
+    """
+    def needs(it: Download) -> bool:
+        return needs_download(it, containers.get((it.media_url.course_id, it.media_url.url)))
+
+    for i, it in enumerate(downloads):
+        if not it.links or not needs(it):
+            continue
+
+        existing = next((target for target in it.links if not needs(target)), None)
+        if existing is None:
+            continue
+
+        existing.links = [it] + [target for target in it.links if target is not existing]
+        it.links = []
+        downloads[i] = existing
+
+
 async def download(session: AuthenticatedSession, it: Download, limiter: RateLimiter, semaphore: asyncio.Semaphore) -> bool:
     """
     Downloads into a temporary file, which only replaces the target once it is complete.
@@ -415,6 +437,7 @@ async def download_media_urls(db: DatabaseSession, session: AuthenticatedSession
     corrupted = [it for it in resolved if it.media_type == MediaType.corrupted]
     downloads = resolve_conflicts([it for it in resolved if it.media_type != MediaType.corrupted])
     adopt_existing_locations(downloads + [target for it in downloads for target in it.links], config)
+    prefer_existing_copies(downloads, containers)
 
     to_download = [it for it in downloads if needs_download(it, containers.get((it.media_url.course_id, it.media_url.url)))]
     print(f"Found {len(resolved)} files: {len(to_download)} {'to download' if should_download else 'missing or changed'} ({HumanBytes.format_str(sum(it.size for it in to_download))}), {len(corrupted)} are not downloadable.")
