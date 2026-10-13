@@ -131,7 +131,7 @@ class AuthenticatedSession:
         return Error()
 
     def post(self, url: str, data: dict[str, Any] | list[dict[str, Any]], post_json: bool, **kwargs: Any) -> _RequestContextManager | Error:
-        kwargs = {"json" if post_json else "data": data}
+        kwargs["json" if post_json else "data"] = data
 
         for i in range(num_tries_download):
             try:

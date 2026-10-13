@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from abc import abstractmethod
 from collections import defaultdict
 from json import JSONDecodeError
 from typing import Any, cast, TYPE_CHECKING
+from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session as DatabaseSession
 
@@ -33,6 +35,10 @@ class APIEndpoint:
         ...
 
     @classmethod
+    def query_params(cls, session: AuthenticatedSession) -> dict[str, Any]:
+        return {}
+
+    @classmethod
     def enrich_data(cls, session: AuthenticatedSession, data: dict[str, Any] | list[dict[str, Any]] | None) -> dict[str, Any] | list[dict[str, Any]]:
         cls_data = cls.json_data(session)
 
@@ -50,7 +56,7 @@ class APIEndpoint:
 
     @classmethod
     async def _get_(cls, session: AuthenticatedSession, data: dict[str, Any] | list[dict[str, Any]], post_json: bool) -> Any | None:
-        async with session.post(cls.url, data, post_json) as response:
+        async with session.post(cls.url, data, post_json, params=cls.query_params(session)) as response:
 
             if isinstance(response, Error) or not response.ok:
                 return None
@@ -95,6 +101,11 @@ class AjaxAPIEndpoint(APIEndpoint):
         }
 
     @classmethod
+    def query_params(cls, session: AuthenticatedSession) -> dict[str, Any]:
+        # The AJAX service authenticates with the session key instead of the API token
+        return {"sesskey": session.session_key}
+
+    @classmethod
     async def _get(cls, session: AuthenticatedSession, data: dict[str, Any] | list[dict[str, Any]] | None = None) -> Any | None:
         return await super()._get_(session, cls.enrich_data(session, data), post_json=True)
 
@@ -103,13 +114,34 @@ class VideoListAPI(AjaxAPIEndpoint):
     function = "mod_videoservice_get_videos"
 
     @classmethod
-    async def get(cls, session: AuthenticatedSession, courses: list[Course]) -> Any:
+    async def get(cls, db: DatabaseSession, session: AuthenticatedSession, courses: list[Course]) -> list[MediaURL] | None:
         data = [{
-            "args": {"courseid": course.course_id},
+            "args": {"courseid": course.id},
             "index": i
         } for i, course in enumerate(courses)]
 
-        return await super()._get(session, data)
+        response: list[dict[str, Any]] | None = await super()._get(session, data)
+        if response is None:
+            return None
+
+        # The same video may be listed more than once per course (e.g. in multiple collections)
+        videos = list({
+            (it["data"]["courseid"], normalize_url(video["url"])): {
+                "url": normalize_url(video["url"]), "course_id": it["data"]["courseid"], "media_type": MediaType.video, "relative_path": "",
+                "name": video["title"].strip() + video["fileext"], "size": None, "time_created": video["timecreated"], "time_modified": video["timecreated"],
+            }
+            for it in response if not it["error"]
+            for video in it["data"]["videos"]
+        }.values())
+
+        existing_containers = {(it.course_id, normalize_url(it.url)): it for it in read_downloadable_media_containers(db)}
+
+        return add_or_update_objects_to_database(
+            db, existing_containers, videos, MediaURL, lambda x: (x["course_id"], x["url"]),
+            {"url": "url", "course_id": "course_id", "media_type": "media_type", "relative_path": "relative_path",
+             "name": "name", "size": "size", "time_created": "time_created", "time_modified": "time_modified"},
+            {"time_created": datetime_fromtimestamp_with_None, "time_modified": datetime_fromtimestamp_with_None}
+        )
 
 
 class UserIDAPI(MoodleAPIEndpoint):
@@ -194,11 +226,21 @@ class DocumentListAPI(MoodleAPIEndpoint):
         return file
 
     @staticmethod
-    def _parse_files_from_regex(course_contents_str: str, course_id: int) -> list[dict[str, Any]]:
+    def _parse_files_from_regex(course_contents_str: str, course_id: int, module_ids: set[str]) -> list[dict[str, Any]]:
         all_files = []
 
-        for url in url_finder.findall(course_contents_str):
+        for url in {normalize_url(it) for it in url_finder.findall(course_contents_str)}:
             if isis_ignore.match(url) is not None or extern_ignore.match(url) is not None:
+                continue
+
+            # Links to modules of the course (e.g. `mod/resource/view.php?id=…`) are already covered by their contents
+            module_id = re.findall(r"https://isis\.tu-berlin\.de/.*/view\.php\?id=(\d*).*", url)
+            if len(module_id) == 1 and module_id[0] in module_ids:
+                continue
+
+            # The regex also matches strings that only look like domains, e.g. `README.MD`
+            parsed = urlparse(url)
+            if not parsed.scheme or not parsed.netloc:
                 continue
 
             all_files.append({
@@ -235,7 +277,7 @@ class DocumentListAPI(MoodleAPIEndpoint):
         return files_without_duplicates
 
     @classmethod
-    async def get(cls, db: DatabaseSession, session: AuthenticatedSession, courses: list[Course]) -> Any:
+    async def get(cls, db: DatabaseSession, session: AuthenticatedSession, courses: list[Course], config: Config) -> Any:
         requests = [cls._get(session, data={"courseid": course.id}) for course in courses]
         normalized_files_with_duplicates: list[dict[str, int | None | MediaType | str]] = []
 
@@ -266,8 +308,12 @@ class DocumentListAPI(MoodleAPIEndpoint):
                 if (url := file.get("fileurl", None)) is not None and isis_ignore.match(url) is None and extern_ignore.match(url) is None
             )
 
-            parsed_files_from_regex = cls._parse_files_from_regex(str(course_contents), course_id)
-            normalized_files_with_duplicates.extend(parsed_files_from_regex)
+            if config.dl_follow_links:
+                module_ids = {str(module["id"]) for week in course_contents for module in week.get("modules", []) if "id" in module}
+                normalized_files_with_duplicates.extend(cls._parse_files_from_regex(str(course_contents), course_id, module_ids))
+
+        if not config.dl_follow_links:
+            normalized_files_with_duplicates = [it for it in normalized_files_with_duplicates if it["media_type"] != MediaType.extern]
 
         files = cls._filter_duplicates_from_files(normalized_files_with_duplicates)
 
@@ -375,6 +421,34 @@ class CourseUnEnrollmentAPI(MoodleAPIEndpoint):
 
 class AssignmentAPI(MoodleAPIEndpoint):
     function = "mod_assign_get_assignments"
+
+    @classmethod
+    async def get(cls, db: DatabaseSession, session: AuthenticatedSession, courses: list[Course]) -> list[MediaURL] | None:
+        response: dict[str, Any] | None = await cls._get(session)
+        if response is None:
+            return None
+
+        course_ids = {course.id for course in courses}
+
+        # The attachments of an assignment are placed in a directory named after it
+        files = list({
+            (course["id"], normalize_url(file["fileurl"])): {
+                "url": normalize_url(file["fileurl"]), "course_id": course["id"], "media_type": MediaType.document, "relative_path": assignment["name"],
+                "name": file["filename"], "size": file["filesize"] or None, "time_created": file["timemodified"] or None, "time_modified": file["timemodified"] or None,
+            }
+            for course in response["courses"] if course["id"] in course_ids
+            for assignment in course["assignments"]
+            for file in assignment.get("introattachments", []) if file.get("fileurl") is not None
+        }.values())
+
+        existing_containers = {(it.course_id, normalize_url(it.url)): it for it in read_downloadable_media_containers(db)}
+
+        return add_or_update_objects_to_database(
+            db, existing_containers, files, MediaURL, lambda x: (x["course_id"], x["url"]),
+            {"url": "url", "course_id": "course_id", "media_type": "media_type", "relative_path": "relative_path",
+             "name": "name", "size": "size", "time_created": "time_created", "time_modified": "time_modified"},
+            {"time_created": datetime_fromtimestamp_with_None, "time_modified": datetime_fromtimestamp_with_None}
+        )
 
 # TODO Content parsing:
 #   - try out core_courseformat_get_state (ajax)

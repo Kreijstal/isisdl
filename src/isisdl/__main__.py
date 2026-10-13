@@ -49,7 +49,7 @@ async def _new_main() -> None:
         if courses is None:
             return
 
-        urls = await gather_media_urls(db, session, courses)
+        urls = await gather_media_urls(db, session, courses, config)
         # if urls is None:
         #     return
 
