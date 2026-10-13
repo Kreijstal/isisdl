@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import filecmp
 import os
 import re
 import sqlite3
@@ -370,9 +371,27 @@ async def download(session: AuthenticatedSession, it: Download, limiter: RateLim
 
 
 def link(source: Download, target: Download) -> None:
+    # Link to a temporary name first, so the target is replaced atomically
     target.path.parent.mkdir(parents=True, exist_ok=True)
-    target.path.unlink(missing_ok=True)
-    os.link(source.path, target.path)
+    temp_file = target.path.with_name(f".{target.path.name}.isisdl-link")
+    temp_file.unlink(missing_ok=True)
+    os.link(source.path, temp_file)
+    os.replace(temp_file, target.path)
+
+
+def is_identical_copy(source: Download, target: Download) -> bool:
+    """
+    1.3 sometimes stored the same file twice instead of hardlinking it. Those copies are only replaced if their content is identical.
+    """
+    try:
+        source_stat, target_stat = source.path.stat(), target.path.stat()
+    except OSError:
+        return False
+
+    if source_stat.st_dev != target_stat.st_dev or source_stat.st_ino == target_stat.st_ino or source_stat.st_size != target_stat.st_size:
+        return False
+
+    return filecmp.cmp(source.path, target.path, shallow=False)
 
 
 def read_legacy_checksums() -> dict[tuple[int, str], tuple[int, str]]:
@@ -484,6 +503,7 @@ async def download_media_urls(db: DatabaseSession, session: AuthenticatedSession
         return calculate_local_checksum(it.path)
 
     stored = [(it, None) for it in corrupted]
+    relinked: list[Download] = []
     for it in downloads:
         if id(it) in failed:
             continue
@@ -495,7 +515,14 @@ async def download_media_urls(db: DatabaseSession, session: AuthenticatedSession
             if needs_download(target, containers.get((target.media_url.course_id, target.media_url.url))):
                 link(it, target)
 
+            elif is_identical_copy(it, target):
+                link(it, target)
+                relinked.append(target)
+
             stored.append((target, checksum))
+
+    if relinked:
+        print(f"Replaced {len(relinked)} identical copies with hardlinks, freeing {HumanBytes.format_str(sum(it.size for it in relinked))}.")
 
     store_containers(db, stored)
 
