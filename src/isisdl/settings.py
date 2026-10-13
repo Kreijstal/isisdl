@@ -34,6 +34,9 @@ intern_dir_location = ".intern"
 # The name of the SQLite Database
 database_file_location = os.path.join(intern_dir_location, ".state.db")
 
+# isisdl <= 1.3 keeps its database in the working directory itself. It is only ever read, to import the config.
+legacy_database_file_location = ".state.db"
+
 log_file_location = os.path.join(intern_dir_location, "isisdl.log")
 
 datetime_str = "%Y-%m-%d %H:%M:%S"
@@ -376,7 +379,7 @@ def check_online() -> bool:
 is_online = check_online()
 
 # Check if the user is executing the library for the first time → .state.db should be missing
-is_first_time = not os.path.exists(os.path.join(working_dir_location, database_file_location))
+is_first_time = not os.path.exists(os.path.join(working_dir_location, database_file_location)) and not os.path.exists(os.path.join(working_dir_location, legacy_database_file_location))
 
 # --- Test options ---
 

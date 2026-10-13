@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import secrets
 import sqlite3
 import time
@@ -10,7 +12,10 @@ from sqlite3 import Connection, Cursor
 from threading import Lock
 from typing import TYPE_CHECKING, cast, Set, Dict, List, Any, Union, DefaultDict, Iterable, Tuple
 
-from isisdl.settings import database_file_location, error_text, bad_url_cache_reeval_times_mul, bad_url_cache_reeval_exp, \
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+from isisdl.settings import database_file_location, legacy_database_file_location, master_password, password_hash_algorithm, password_hash_length, password_hash_iterations, error_text, bad_url_cache_reeval_times_mul, bad_url_cache_reeval_exp, \
     bad_url_cache_reeval_static_mul, random_salt_length
 
 if TYPE_CHECKING:
@@ -42,6 +47,11 @@ class BadUrl:
         return bool(time.time() > self.last_checked + (self.times_checked * bad_url_cache_reeval_times_mul) ** bad_url_cache_reeval_exp * bad_url_cache_reeval_static_mul)
 
 
+def derive_key(password: str, salt: bytes, iterations: int) -> bytes:
+    kdf = PBKDF2HMAC(algorithm=password_hash_algorithm(), length=password_hash_length, salt=salt, iterations=iterations)
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+
 class DatabaseHelper:
     con: Connection
     cur: Cursor
@@ -55,9 +65,13 @@ class DatabaseHelper:
 
     def __init__(self) -> None:
         from isisdl.utils import path
+        is_new_database = not os.path.exists(path(database_file_location))
         self.con = sqlite3.connect(path(database_file_location), check_same_thread=False)
         self.cur = self.con.cursor()
         self.create_default_tables()
+
+        if is_new_database and os.path.exists(path(legacy_database_file_location)):
+            self.import_legacy_config(path(legacy_database_file_location))
 
         # This leads to *way* better performance on slow drives with high latency.
         self.cur.execute("PRAGMA synchronous = OFF")
@@ -108,6 +122,43 @@ class DatabaseHelper:
                 )
             """)
 
+            self.con.commit()
+
+    def import_legacy_config(self, legacy_path: str) -> None:
+        """
+        isisdl <= 1.3 stores its config as one json string. The legacy database is opened read-only, so 1.3 keeps working on it.
+        """
+        try:
+            legacy = sqlite3.connect(f"file:{legacy_path}?mode=ro", uri=True)
+            row = legacy.execute("SELECT json FROM json_strings WHERE id=\"config\"").fetchone()
+            legacy.close()
+
+        except sqlite3.Error:
+            return
+
+        if row is None:
+            return
+
+        legacy_config = json.loads(row[0])
+        legacy_config["salt"] = secrets.token_urlsafe(random_salt_length)
+
+        # 1.3 derives the key with a static salt and fewer iterations, so the password is re-encrypted with the new parameters.
+        # A passphrase-protected password cannot be re-encrypted without the passphrase: then only the username is kept.
+        password = None
+        if legacy_config.get("password") is not None and not legacy_config.get("password_encrypted"):
+            try:
+                password = Fernet(derive_key(master_password, b"salty~salt", 390_000)).decrypt(legacy_config["password"].encode()).decode()
+            except InvalidToken:
+                pass
+
+        if password is None:
+            legacy_config["password"] = None
+            legacy_config["password_encrypted"] = False
+        else:
+            legacy_config["password"] = Fernet(derive_key(master_password, legacy_config["salt"].encode(), password_hash_iterations)).encrypt(password.encode()).decode()
+
+        with self.lock:
+            self.cur.executemany("INSERT OR IGNORE INTO config VALUES (?, ?)", [(key, json.dumps(value)) for key, value in legacy_config.items()])
             self.con.commit()
 
     def close_connection(self) -> None:

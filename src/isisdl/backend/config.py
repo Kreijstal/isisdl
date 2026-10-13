@@ -7,6 +7,7 @@ from typing import List, Optional, Union, Set, Dict, Any
 
 from colorama import Style
 
+from isisdl.backend.crud import replace_user_in_new_database
 from isisdl.backend.crypt import get_credentials, store_user
 from isisdl.backend.request_helper import RequestHelper, SessionWithKey
 from isisdl.settings import is_online, error_text, forbidden_chars
@@ -94,6 +95,7 @@ def authentication_prompt() -> None:
         config.username = None
         config.password = None
         config.password_encrypted = None
+        replace_user_in_new_database(None, None)
         return
 
     while True:
@@ -122,6 +124,7 @@ def authentication_prompt() -> None:
             print("The passphrases do not match. Try again.\n")
 
     store_user(user, additional_passphrase)
+    replace_user_in_new_database(user.username, user.password, additional_passphrase)
 
 
 def filename_prompt() -> None:
@@ -297,6 +300,7 @@ Do you want to store the password unencrypted?
             else:
                 user = get_credentials()
                 store_user(user)
+                replace_user_in_new_database(user.username, user.password)
                 print("The password is now stored unencrypted.")
                 print("\nPlease press enter to continue\n")
                 input()

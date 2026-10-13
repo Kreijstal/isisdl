@@ -17,8 +17,24 @@ from isisdl.version import __version__
 
 
 async def authenticate_new_session(user: User, config: Config) -> AuthenticatedSession | None:
-    session = InternetSession(headers={"User-Agent": f"isisdl (Python aiohttp) version {__version__}"})
+    password = user.decrypt_password(config)
+    if password is None:
+        return None
 
+    return await authenticate_with_password(user.username, password)
+
+
+async def authenticate_with_password(username: str, password: str) -> AuthenticatedSession | None:
+    session = InternetSession(headers={"User-Agent": f"isisdl (Python aiohttp) version {__version__}"})
+    authenticated = await _authenticate(session, username, password)
+
+    if authenticated is None:
+        await session.close()
+
+    return authenticated
+
+
+async def _authenticate(session: InternetSession, username: str, password: str) -> AuthenticatedSession | None:
     # First step of authenticating
     await session.get("https://isis.tu-berlin.de/auth/shibboleth/index.php")
     await session.post(
@@ -37,7 +53,7 @@ async def authenticate_new_session(user: User, config: Config) -> AuthenticatedS
     # Second step: submit the password
     async with session.post(
         "https://shibboleth.tubit.tu-berlin.de/idp/profile/SAML2/Redirect/SSO?execution=e1s2",
-        data={"j_username": user.username, "j_password": user.decrypt_password(config), "_eventId_proceed": ""}
+        data={"j_username": username, "j_password": password, "_eventId_proceed": ""}
     ) as response:
 
         # Check if authentication succeeded
