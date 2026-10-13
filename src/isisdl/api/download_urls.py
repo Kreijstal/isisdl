@@ -55,9 +55,16 @@ class Download:
     time: datetime
     links: list[Download] = field(default_factory=list)
 
+    # The name before `resolve_conflicts` added a suffix like `.0` to it
+    original_name: str | None = None
+
     @property
     def path(self) -> Path:
         return path(self.course_dir, self.relative_path, self.name)
+
+    @property
+    def original_path(self) -> Path:
+        return path(self.course_dir, self.relative_path, self.original_name or self.name)
 
     @property
     def throttle_type(self) -> ThrottleType:
@@ -98,7 +105,8 @@ def token_params(session: AuthenticatedSession, url: str) -> dict[str, str]:
 def from_container(media_url: MediaURL, container: MediaContainer) -> Download:
     return Download(
         media_url, course_directory(media_url.course), container.download_url, container.media_type,
-        container.relative_path, container.name, container.size, container.time_modified
+        container.relative_path, container.name, container.size, container.time_modified,
+        original_name=sanitize_name(media_url.name, False) if media_url.name is not None else None,
     )
 
 
@@ -206,19 +214,39 @@ def resolve_conflicts(downloads: list[Download]) -> list[Download]:
         first.links.extend(other for other in others if other.path != first.path)
         (remaining if not others else final).append(first)
 
+    # Files reused from a MediaContainer keep the name they were downloaded with, which may carry a suffix like `name.0.ext`.
+    # They are grouped by their original name, so that their siblings that are resolved again (e.g. because their download failed)
+    # are still suffixed, but never with a name that is already taken.
     same_path: defaultdict[Path, list[Download]] = defaultdict(list)
     for it in remaining:
-        same_path[it.path].append(it)
+        same_path[it.original_path].append(it)
+
+    taken = {it.path for it in downloads}
 
     renamed = []
     for group in same_path.values():
-        if len(group) == 1:
+        reused = [it for it in group if it.original_name is not None]
+        group = [it for it in group if it.original_name is None]
+        renamed.extend(reused)
+
+        if len(group) == 1 and not reused:
             renamed.append(group[0])
+            continue
+
+        if not group:
             continue
 
         # 1.3 assigned the suffixes in random order for files with the same time. Keep the assignment of files that already exist.
         basename, ext = os.path.splitext(group[0].name)
-        names = [sanitize_name(f"{basename}.{i}{ext}", False) for i in range(len(group))]
+        names: list[str] = []
+        suffix = 0
+        while len(names) < len(group):
+            name = sanitize_name(f"{basename}.{suffix}{ext}", False)
+            if group[0].path.parent.joinpath(name) not in taken:
+                names.append(name)
+            suffix += 1
+
+        taken.update(group[0].path.parent.joinpath(name) for name in names)
         remaining_files = sorted(group, key=order)
         assignment: dict[int, Download] = {}
 
@@ -232,7 +260,7 @@ def resolve_conflicts(downloads: list[Download]) -> list[Download]:
                 assignment[i] = match
                 remaining_files.remove(match)
 
-        for i, it in zip([i for i in range(len(group)) if i not in assignment], remaining_files):
+        for i, it in zip([i for i in range(len(names)) if i not in assignment], remaining_files):
             assignment[i] = it
 
         for i, it in assignment.items():
