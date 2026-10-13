@@ -68,14 +68,17 @@ class SessionWithKey(Session):
                     })
 
             response = s.post_("https://shibboleth.tubit.tu-berlin.de/idp/profile/SAML2/Redirect/SSO?execution=e1s2",
-                               params={"j_username": user.username, "j_password": user.password, "_eventId_proceed": ""})
+                               data={"j_username": user.username, "j_password": user.password, "_eventId_proceed": ""})
 
             if response is None or response.url == "https://shibboleth.tubit.tu-berlin.de/idp/profile/SAML2/Redirect/SSO?execution=e1s3":
                 # The redirection did not work → credentials are wrong
                 return None
 
-            data = {k: unescape(v) for k, v in re.findall('<input type="hidden" name="(.*)" value="(.*)"/>', response.text)}
-            response = s.post_("https://isis.tu-berlin.de/Shibboleth.sso/SAML2/POST-SimpleSign", data=data)
+            # Post the SAML response wherever the IdP's auto-submit form points (ISIS moved from POST-SimpleSign to POST)
+            data = {k: unescape(v) for k, v in re.findall('<input type="hidden" name="(.*?)" value="(.*?)"/>', response.text)}
+            action = re.search(r'<form action="(.*?)" method="post"', response.text)
+            saml_url = unescape(action.group(1)) if action else "https://isis.tu-berlin.de/Shibboleth.sso/SAML2/POST"
+            response = s.post_(saml_url, data=data)
 
             if response is None:
                 return None
