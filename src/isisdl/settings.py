@@ -16,7 +16,10 @@ from typing import Any, DefaultDict, Dict, Optional, Set, NoReturn
 
 import psutil as psutil
 from cryptography.hazmat.primitives.hashes import SHA3_512
-from psutil._common import sdiskpart
+try:
+    from psutil._common import sdiskpart
+except ImportError:  # psutil >= 7.2 moved the named tuples
+    from psutil._ntuples import sdiskpart
 from yaml import YAMLError, safe_load
 
 import isisdl.autorun

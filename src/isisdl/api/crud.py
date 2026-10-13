@@ -37,19 +37,21 @@ async def authenticate_new_session(user: User, config: Config) -> AuthenticatedS
     # Second step: submit the password
     async with session.post(
         "https://shibboleth.tubit.tu-berlin.de/idp/profile/SAML2/Redirect/SSO?execution=e1s2",
-        params={"j_username": user.username, "j_password": user.decrypt_password(config), "_eventId_proceed": ""}
+        data={"j_username": user.username, "j_password": user.decrypt_password(config), "_eventId_proceed": ""}
     ) as response:
 
         # Check if authentication succeeded
         if response is None or "https://shibboleth.tubit.tu-berlin.de/idp/profile/SAML2/Redirect/SSO?execution=e1s3" in str(response.url):
             return None
 
-        data = {k: unescape(v) for k, v in re.findall('<input type="hidden" name="(.*)" value="(.*)"/>', await response.text())}
+        text = await response.text()
+        data = {k: unescape(v) for k, v in re.findall('<input type="hidden" name="(.*?)" value="(.*?)"/>', text)}
 
-    async with session.post(
-        "https://isis.tu-berlin.de/Shibboleth.sso/SAML2/POST-SimpleSign",
-        data=data
-    ) as response:
+        # Post the SAML response wherever the IdP's auto-submit form points (ISIS moved from POST-SimpleSign to POST)
+        action = re.search(r'<form action="(.*?)" method="post"', text)
+        saml_url = unescape(action.group(1)) if action else "https://isis.tu-berlin.de/Shibboleth.sso/SAML2/POST"
+
+    async with session.post(saml_url, data=data) as response:
 
         # Extract the session key
         _session_key = re.search(r"\"sesskey\":\"(.*?)\"", await response.text())
