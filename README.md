@@ -1,5 +1,12 @@
 # isisdl
 
+> **Mirror notice:** The original repository (`github.com/Emily3403/isisdl`) and the
+> [PyPI project](https://pypi.org/project/isisdl/) were deleted in 2026. This repository restores the
+> upstream history up to May 2024 from the surviving forks
+> ([lhoenig](https://github.com/lhoenig/isisdl), [bchmnn](https://github.com/bchmnn/isisdl)). The 1.3.20 and
+> 1.3.21 release commits were reconstructed from the PyPI sdists, recovered via the NixOS source mirror.
+> All credit goes to the original author, Emily3403; the code remains licensed under GPLv3 (see `LICENSE`).
+
 <div style="display: inline-block">
 
 ![Tests](https://github.com/Emily3403/isisdl/actions/workflows/tests.yml/badge.svg) 
