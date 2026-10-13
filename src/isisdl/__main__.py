@@ -53,10 +53,7 @@ async def _new_main() -> None:
         # if urls is None:
         #     return
 
-        # urls = read_downloadable_media_containers(db)
-        downloaded_content = await download_media_urls(db, urls)
-
-        _ = downloaded_content
+        await download_media_urls(db, session, urls, config)
 
         # TODO: How to deal with crashing threads
         #   - Have a menu which enables 3 choices:
@@ -64,10 +61,7 @@ async def _new_main() -> None:
         #     - restart with next file
         #     - ignore and keep the thread dead
 
-        await asyncio.sleep(50)
-
-        # TODO: Can I somehow move this to the __del__ method?
-        await session.session.close()
+        await session.close()
 
 
 def _main() -> None:

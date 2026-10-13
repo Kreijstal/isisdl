@@ -189,6 +189,7 @@ class RateLimiter:
                     self.depleted_tokens = ThrottleDict.from_default(0)
 
                 num_bytes_downloaded_since_last_update = sum(it.num_bytes for it in self.returned_tokens)
+                self.returned_tokens = []
                 self.bytes_downloaded = self.bytes_downloaded[-num_to_keep_in_bytes_downloaded:]
                 self.bytes_downloaded.append(num_bytes_downloaded_since_last_update)
 

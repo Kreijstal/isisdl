@@ -7,7 +7,7 @@ from enum import Enum
 from types import TracebackType
 from typing import Any, Type
 
-from aiohttp import ClientSession as InternetSession
+from aiohttp import ClientSession as InternetSession, ClientTimeout
 from aiohttp.client import _RequestContextManager
 from sqlalchemy import Text, Enum as SQLEnum, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -77,7 +77,7 @@ class MediaContainer(DataBase):  # type:ignore[valid-type, misc]
     size: Mapped[int] = mapped_column(nullable=False)
     time_created: Mapped[datetime] = mapped_column(nullable=False)
     time_modified: Mapped[datetime] = mapped_column(nullable=False)
-    checksum: Mapped[str] = mapped_column(Text)
+    checksum: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), primary_key=True)
 
@@ -104,7 +104,13 @@ class AuthenticatedSession:
     api_token: str
 
     @staticmethod
-    def calculate_timeout(url: str, times_retried: int) -> float | None:
+    def calculate_timeout(url: str, times_retried: int) -> ClientTimeout:
+        # Like the timeout of `requests`: it applies to connecting and to each read, not to the whole download
+        timeout = AuthenticatedSession._calculate_timeout(url, times_retried)
+        return ClientTimeout(total=None, sock_connect=timeout, sock_read=timeout)
+
+    @staticmethod
+    def _calculate_timeout(url: str, times_retried: int) -> float | None:
         from isisdl.api.endpoints import MoodleAPIEndpoint
 
         if url == MoodleAPIEndpoint.url:
